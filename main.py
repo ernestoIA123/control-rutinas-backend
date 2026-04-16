@@ -253,22 +253,24 @@ def get_customer_email(customer_id: Optional[str]) -> Optional[str]:
     if not customer_id:
         return None
     customer = stripe.Customer.retrieve(customer_id)
-    return normalize_email(customer.get("email", ""))
+    email = getattr(customer, "email", None)
+    return normalize_email(email or "")
 
 
 def get_subscription_status(subscription_id: Optional[str]) -> Optional[str]:
     if not subscription_id:
         return None
     subscription = stripe.Subscription.retrieve(subscription_id)
-    return (subscription.get("status") or "").strip().lower() or None
+    status = getattr(subscription, "status", None)
+    return (status or "").strip().lower() or None
 
 
 def get_subscription_period_end(subscription_id: Optional[str]) -> Optional[str]:
     if not subscription_id:
         return None
     subscription = stripe.Subscription.retrieve(subscription_id)
-    return to_iso_from_unix(subscription.get("current_period_end"))
-
+    current_period_end = getattr(subscription, "current_period_end", None)
+    return to_iso_from_unix(current_period_end)
 
 @app.get("/")
 def root():
