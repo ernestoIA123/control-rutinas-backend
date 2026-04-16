@@ -435,7 +435,7 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Firma inválida")
 
     event_type = event["type"]
-    data_object = event["data"]["object"]
+    data_object = event["data"]["object"].to_dict()
 
     try:
         if event_type == "checkout.session.completed":
