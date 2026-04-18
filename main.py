@@ -102,6 +102,8 @@ class ActivateUserRequest(BaseModel):
     plan: Optional[str] = None
     current_period_end: Optional[str] = None
 
+class CancelSubscriptionRequest(BaseModel):
+    email: str
 
 def get_user_by_email(email: str):
     email = normalize_email(email)
@@ -375,10 +377,10 @@ def validate_access(body: ValidateAccessRequest):
         "access_active": access_active,
         "subscription_status": subscription_status,
         "plan": user.get("plan") or "free",
+        "current_period_end": user.get("current_period_end"),
         "should_show_paywall": should_show_paywall,
         "message": "" if access_active else "Tu plan no está activo.",
     }
-
 
 @app.post("/activate-user")
 def activate_user(body: ActivateUserRequest):
@@ -414,7 +416,58 @@ def activate_user(body: ActivateUserRequest):
     data = result.data or []
     return {"ok": True, "data": data[0] if data else get_user_by_email(email)}
 
+@app.post("/cancel-subscription")
+def cancel_subscription(body: CancelSubscriptionRequest):
+    email = normalize_email(body.email)
+    if not email:
+        raise HTTPException(status_code=400, detail="Email requerido")
 
+    user = get_user_by_email(email)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    if email == ADMIN_EMAIL or user.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="No se puede cancelar la suscripción del administrador")
+
+    subscription_id = (user.get("stripe_subscription_id") or "").strip()
+    if not subscription_id:
+        raise HTTPException(status_code=400, detail="No se encontró una suscripción activa para este usuario")
+
+    try:
+        subscription = stripe.Subscription.modify(
+            subscription_id,
+            cancel_at_period_end=True,
+        )
+
+        current_period_end = to_iso_from_unix(getattr(subscription, "current_period_end", None))
+        status = (getattr(subscription, "status", None) or user.get("subscription_status") or "active").strip().lower()
+
+        updated = (
+            supabase.table("usuarios")
+            .update({
+                "subscription_status": status,
+                "current_period_end": current_period_end,
+                "updated_at": now_iso(),
+            })
+            .eq("email", email)
+            .execute()
+        )
+
+        data = updated.data or []
+        fresh_user = data[0] if data else get_user_by_email(email)
+
+        return {
+            "ok": True,
+            "message": "Tu suscripción fue cancelada. Puedes seguir usando la app hasta que venza tu plan mensual.",
+            "cancel_at_period_end": True,
+            "current_period_end": fresh_user.get("current_period_end") if fresh_user else current_period_end,
+            "subscription_status": fresh_user.get("subscription_status") if fresh_user else status,
+        }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Error cancelando suscripción en Stripe: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error interno cancelando suscripción: {str(e)}")
+    
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
