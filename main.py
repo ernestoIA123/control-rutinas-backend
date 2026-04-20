@@ -93,6 +93,8 @@ class CheckoutRequest(BaseModel):
 
 class ValidateAccessRequest(BaseModel):
     email: str
+    device_id: str
+    claim_device: bool = False
 
 
 class ActivateUserRequest(BaseModel):
@@ -102,8 +104,10 @@ class ActivateUserRequest(BaseModel):
     plan: Optional[str] = None
     current_period_end: Optional[str] = None
 
+
 class CancelSubscriptionRequest(BaseModel):
     email: str
+
 
 def get_user_by_email(email: str):
     email = normalize_email(email)
@@ -111,11 +115,7 @@ def get_user_by_email(email: str):
         return None
 
     result = (
-        supabase.table("usuarios")
-        .select("*")
-        .eq("email", email)
-        .limit(1)
-        .execute()
+        supabase.table("usuarios").select("*").eq("email", email).limit(1).execute()
     )
     data = result.data or []
     return data[0] if data else None
@@ -150,7 +150,14 @@ def safe_bool_access(subscription_status: str, requested_access_active: bool) ->
     status = (subscription_status or "").strip().lower()
     if status in {"active", "trialing"}:
         return True
-    if status in {"canceled", "cancelled", "unpaid", "incomplete_expired", "payment_failed", "inactive"}:
+    if status in {
+        "canceled",
+        "cancelled",
+        "unpaid",
+        "incomplete_expired",
+        "payment_failed",
+        "inactive",
+    }:
         return False
     return bool(requested_access_active)
 
@@ -179,10 +186,7 @@ def ensure_user_linked_to_auth(email: str, existing_user: Optional[dict] = None)
         update_payload["id"] = found_auth_id
 
     updated = (
-        supabase.table("usuarios")
-        .update(update_payload)
-        .eq("email", email)
-        .execute()
+        supabase.table("usuarios").update(update_payload).eq("email", email).execute()
     )
 
     data = updated.data or []
@@ -207,7 +211,9 @@ def upsert_user_access(
 
     is_admin = email == ADMIN_EMAIL
     effective_status = "active" if is_admin else (subscription_status or "inactive")
-    effective_access = True if is_admin else safe_bool_access(effective_status, access_active)
+    effective_access = (
+        True if is_admin else safe_bool_access(effective_status, access_active)
+    )
     effective_plan = "pro" if is_admin else (plan or PLAN_NAME)
     effective_role = "admin" if is_admin else "user"
 
@@ -224,15 +230,11 @@ def upsert_user_access(
     }
 
     if existing:
-        # No pisamos full_name o phone aquí.
         if auth_user_id and not existing.get("auth_user_id"):
             base_payload["auth_user_id"] = auth_user_id
 
         result = (
-            supabase.table("usuarios")
-            .update(base_payload)
-            .eq("email", email)
-            .execute()
+            supabase.table("usuarios").update(base_payload).eq("email", email).execute()
         )
         data = result.data or []
         return data[0] if data else get_user_by_email(email)
@@ -274,6 +276,7 @@ def get_subscription_period_end(subscription_id: Optional[str]) -> Optional[str]
     current_period_end = getattr(subscription, "current_period_end", None)
     return to_iso_from_unix(current_period_end)
 
+
 @app.get("/")
 def root():
     return {
@@ -296,7 +299,6 @@ def create_checkout(body: CheckoutRequest):
         raise HTTPException(status_code=400, detail="Email requerido")
 
     try:
-        # Si ya existe en auth o en la tabla, lo dejamos preparado.
         existing = get_user_by_email(email)
         if existing:
             ensure_user_linked_to_auth(email, existing)
@@ -334,12 +336,17 @@ def create_checkout(body: CheckoutRequest):
 @app.post("/validate-access")
 def validate_access(body: ValidateAccessRequest):
     email = normalize_email(body.email)
+    device_id = (body.device_id or "").strip()
+    claim_device = bool(body.claim_device)
+
     if not email:
         raise HTTPException(status_code=400, detail="Email requerido")
 
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id requerido")
+
     user = get_user_by_email(email)
 
-    # Si no existe y es el admin principal, lo creamos automáticamente.
     if not user and email == ADMIN_EMAIL:
         user = upsert_user_access(
             email=email,
@@ -362,7 +369,38 @@ def validate_access(body: ValidateAccessRequest):
             "message": "Usuario no encontrado en tabla usuarios",
         }
 
-    subscription_status = (user.get("subscription_status") or "inactive").strip().lower()
+    saved_device_id = (user.get("device_id") or "").strip()
+
+    if not saved_device_id:
+        supabase.table("usuarios").update(
+            {
+                "device_id": device_id,
+                "updated_at": now_iso(),
+            }
+        ).eq("email", email).execute()
+        user = get_user_by_email(email)
+
+    elif saved_device_id != device_id and claim_device:
+        supabase.table("usuarios").update(
+            {
+                "device_id": device_id,
+                "updated_at": now_iso(),
+            }
+        ).eq("email", email).execute()
+        user = get_user_by_email(email)
+
+    elif saved_device_id != device_id and not claim_device:
+        return {
+            "ok": True,
+            "exists": True,
+            "access_active": False,
+            "device_mismatch": True,
+            "message": "Tu cuenta se abrió en otro dispositivo.",
+        }
+
+    subscription_status = (
+        (user.get("subscription_status") or "inactive").strip().lower()
+    )
     access_active = bool(user.get("access_active", False))
 
     if email == ADMIN_EMAIL or user.get("role") == "admin":
@@ -379,8 +417,10 @@ def validate_access(body: ValidateAccessRequest):
         "plan": user.get("plan") or "free",
         "current_period_end": user.get("current_period_end"),
         "should_show_paywall": should_show_paywall,
+        "device_mismatch": False,
         "message": "" if access_active else "Tu plan no está activo.",
     }
+
 
 @app.post("/activate-user")
 def activate_user(body: ActivateUserRequest):
@@ -393,7 +433,8 @@ def activate_user(body: ActivateUserRequest):
         user = upsert_user_access(
             email=email,
             access_active=body.access_active,
-            subscription_status=body.subscription_status or ("active" if body.access_active else "inactive"),
+            subscription_status=body.subscription_status
+            or ("active" if body.access_active else "inactive"),
             plan=body.plan or PLAN_NAME,
             current_period_end=body.current_period_end,
         )
@@ -401,20 +442,17 @@ def activate_user(body: ActivateUserRequest):
 
     payload = {
         "access_active": body.access_active,
-        "subscription_status": body.subscription_status or ("active" if body.access_active else "inactive"),
+        "subscription_status": body.subscription_status
+        or ("active" if body.access_active else "inactive"),
         "plan": body.plan or user.get("plan") or PLAN_NAME,
         "current_period_end": body.current_period_end,
         "updated_at": now_iso(),
     }
 
-    result = (
-        supabase.table("usuarios")
-        .update(payload)
-        .eq("email", email)
-        .execute()
-    )
+    result = supabase.table("usuarios").update(payload).eq("email", email).execute()
     data = result.data or []
     return {"ok": True, "data": data[0] if data else get_user_by_email(email)}
+
 
 @app.post("/cancel-subscription")
 def cancel_subscription(body: CancelSubscriptionRequest):
@@ -427,11 +465,17 @@ def cancel_subscription(body: CancelSubscriptionRequest):
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
     if email == ADMIN_EMAIL or user.get("role") == "admin":
-        raise HTTPException(status_code=400, detail="No se puede cancelar la suscripción del administrador")
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede cancelar la suscripción del administrador",
+        )
 
     subscription_id = (user.get("stripe_subscription_id") or "").strip()
     if not subscription_id:
-        raise HTTPException(status_code=400, detail="No se encontró una suscripción activa para este usuario")
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontró una suscripción activa para este usuario",
+        )
 
     try:
         subscription = stripe.Subscription.modify(
@@ -439,16 +483,28 @@ def cancel_subscription(body: CancelSubscriptionRequest):
             cancel_at_period_end=True,
         )
 
-        current_period_end = to_iso_from_unix(getattr(subscription, "current_period_end", None))
-        status = (getattr(subscription, "status", None) or user.get("subscription_status") or "active").strip().lower()
+        current_period_end = to_iso_from_unix(
+            getattr(subscription, "current_period_end", None)
+        )
+        status = (
+            (
+                getattr(subscription, "status", None)
+                or user.get("subscription_status")
+                or "active"
+            )
+            .strip()
+            .lower()
+        )
 
         updated = (
             supabase.table("usuarios")
-            .update({
-                "subscription_status": status,
-                "current_period_end": current_period_end,
-                "updated_at": now_iso(),
-            })
+            .update(
+                {
+                    "subscription_status": status,
+                    "current_period_end": current_period_end,
+                    "updated_at": now_iso(),
+                }
+            )
             .eq("email", email)
             .execute()
         )
@@ -460,14 +516,25 @@ def cancel_subscription(body: CancelSubscriptionRequest):
             "ok": True,
             "message": "Tu suscripción fue cancelada. Puedes seguir usando la app hasta que venza tu plan mensual.",
             "cancel_at_period_end": True,
-            "current_period_end": fresh_user.get("current_period_end") if fresh_user else current_period_end,
-            "subscription_status": fresh_user.get("subscription_status") if fresh_user else status,
+            "current_period_end": (
+                fresh_user.get("current_period_end")
+                if fresh_user
+                else current_period_end
+            ),
+            "subscription_status": (
+                fresh_user.get("subscription_status") if fresh_user else status
+            ),
         }
     except stripe.error.StripeError as e:
-        raise HTTPException(status_code=400, detail=f"Error cancelando suscripción en Stripe: {str(e)}")
+        raise HTTPException(
+            status_code=400, detail=f"Error cancelando suscripción en Stripe: {str(e)}"
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno cancelando suscripción: {str(e)}")
-    
+        raise HTTPException(
+            status_code=500, detail=f"Error interno cancelando suscripción: {str(e)}"
+        )
+
+
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
@@ -504,6 +571,11 @@ async def stripe_webhook(request: Request):
             customer_id = data_object.get("customer")
             status = get_subscription_status(subscription_id) or "active"
             current_period_end = get_subscription_period_end(subscription_id)
+            country = (
+                data_object.get("customer_details", {})
+                .get("address", {})
+                .get("country")
+            )
 
             if email:
                 upsert_user_access(
@@ -516,67 +588,10 @@ async def stripe_webhook(request: Request):
                     current_period_end=current_period_end,
                 )
 
-        elif event_type in {"customer.subscription.created", "customer.subscription.updated"}:
-            customer_id = data_object.get("customer")
-            subscription_id = data_object.get("id")
-            status = (data_object.get("status") or "inactive").strip().lower()
-            current_period_end = to_iso_from_unix(data_object.get("current_period_end"))
-            email = (
-                normalize_email(data_object.get("metadata", {}).get("email"))
-                or get_customer_email(customer_id)
-            )
-
-            if email:
-                upsert_user_access(
-                    email=email,
-                    access_active=(status in {"active", "trialing"}),
-                    subscription_status=status,
-                    plan=PLAN_NAME,
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=subscription_id,
-                    current_period_end=current_period_end,
-                )
-
-        elif event_type == "customer.subscription.deleted":
-            customer_id = data_object.get("customer")
-            subscription_id = data_object.get("id")
-            email = (
-                normalize_email(data_object.get("metadata", {}).get("email"))
-                or get_customer_email(customer_id)
-            )
-
-            if email:
-                upsert_user_access(
-                    email=email,
-                    access_active=False,
-                    subscription_status="canceled",
-                    plan=PLAN_NAME,
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=subscription_id,
-                    current_period_end=None,
-                )
-
-        elif event_type in {"invoice.paid", "invoice.payment_succeeded"}:
-            customer_id = data_object.get("customer")
-            subscription_id = data_object.get("subscription")
-            email = (
-                normalize_email(data_object.get("customer_email"))
-                or normalize_email(data_object.get("metadata", {}).get("email"))
-                or get_customer_email(customer_id)
-            )
-            current_period_end = get_subscription_period_end(subscription_id) if subscription_id else None
-            status = get_subscription_status(subscription_id) if subscription_id else "active"
-
-            if email:
-                upsert_user_access(
-                    email=email,
-                    access_active=True,
-                    subscription_status=status or "active",
-                    plan=PLAN_NAME,
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=subscription_id,
-                    current_period_end=current_period_end,
-                )
+                if country:
+                    supabase.table("usuarios").update({"country": country}).eq(
+                        "email", email
+                    ).execute()
 
         elif event_type == "invoice.payment_failed":
             customer_id = data_object.get("customer")
@@ -586,6 +601,7 @@ async def stripe_webhook(request: Request):
                 or normalize_email(data_object.get("metadata", {}).get("email"))
                 or get_customer_email(customer_id)
             )
+            amount = data_object.get("amount_due", 0)
 
             if email:
                 upsert_user_access(
@@ -598,7 +614,17 @@ async def stripe_webhook(request: Request):
                     current_period_end=None,
                 )
 
+                supabase.table("pagos").insert(
+                    {
+                        "email": email,
+                        "status": "failed",
+                        "amount": amount,
+                    }
+                ).execute()
+
         return {"ok": True, "received": True, "event_type": event_type}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando webhook: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error procesando webhook: {str(e)}"
+        )
