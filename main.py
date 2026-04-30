@@ -478,18 +478,29 @@ def cancel_subscription(body: CancelSubscriptionRequest):
         )
 
     try:
-        subscription = stripe.Subscription.delete(subscription_id)
+        subscription = stripe.Subscription.modify(
+            subscription_id,
+            cancel_at_period_end=True,
+        )
 
         current_period_end = to_iso_from_unix(
             getattr(subscription, "current_period_end", None)
+        )
+        status = (
+            (
+                getattr(subscription, "status", None)
+                or user.get("subscription_status")
+                or "active"
+            )
+            .strip()
+            .lower()
         )
 
         updated = (
             supabase.table("usuarios")
             .update(
                 {
-                    "subscription_status": "canceled",
-                    "access_active": False,
+                    "subscription_status": status,
                     "current_period_end": current_period_end,
                     "updated_at": now_iso(),
                 }
@@ -503,11 +514,15 @@ def cancel_subscription(body: CancelSubscriptionRequest):
 
         return {
             "ok": True,
-            "message": "Tu suscripción fue cancelada correctamente.",
-            "subscription_status": "canceled",
-            "access_active": False,
+            "message": "Tu suscripción fue cancelada. Puedes seguir usando la app hasta que venza tu plan mensual.",
+            "cancel_at_period_end": True,
             "current_period_end": (
-                fresh_user.get("current_period_end") if fresh_user else current_period_end
+                fresh_user.get("current_period_end")
+                if fresh_user
+                else current_period_end
+            ),
+            "subscription_status": (
+                fresh_user.get("subscription_status") if fresh_user else status
             ),
         }
     except stripe.error.StripeError as e:
