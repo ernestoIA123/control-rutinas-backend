@@ -408,17 +408,6 @@ def validate_access(body: ValidateAccessRequest):
         subscription_status = "active"
 
     should_show_paywall = not access_active
-    cancel_at_period_end = False
-
-    subscription_id = (user.get("stripe_subscription_id") or "").strip()
-    if subscription_id:
-        try:
-            stripe_subscription = stripe.Subscription.retrieve(subscription_id)
-            cancel_at_period_end = bool(
-                getattr(stripe_subscription, "cancel_at_period_end", False)
-            )
-        except Exception:
-            cancel_at_period_end = False
 
     return {
         "ok": True,
@@ -429,7 +418,6 @@ def validate_access(body: ValidateAccessRequest):
         "current_period_end": user.get("current_period_end"),
         "should_show_paywall": should_show_paywall,
         "device_mismatch": False,
-        "cancel_at_period_end": cancel_at_period_end,
         "message": "" if access_active else "Tu plan no está activo.",
     }
 
