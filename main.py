@@ -20,7 +20,8 @@ PRICE_ID = os.getenv("PRICE_ID", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip()
 LOGIN_URL = os.getenv("LOGIN_URL", "").strip()
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "netooficial200@gmail.com").strip().lower()
+ADMIN_EMAIL = os.getenv(
+    "ADMIN_EMAIL", "netooficial200@gmail.com").strip().lower()
 
 if not SUPABASE_URL:
     raise RuntimeError("Falta SUPABASE_URL")
@@ -115,7 +116,8 @@ def get_user_by_email(email: str):
         return None
 
     result = (
-        supabase.table("usuarios").select("*").eq("email", email).limit(1).execute()
+        supabase.table("usuarios").select(
+            "*").eq("email", email).limit(1).execute()
     )
     data = result.data or []
     return data[0] if data else None
@@ -186,7 +188,8 @@ def ensure_user_linked_to_auth(email: str, existing_user: Optional[dict] = None)
         update_payload["id"] = found_auth_id
 
     updated = (
-        supabase.table("usuarios").update(update_payload).eq("email", email).execute()
+        supabase.table("usuarios").update(
+            update_payload).eq("email", email).execute()
     )
 
     data = updated.data or []
@@ -210,7 +213,8 @@ def upsert_user_access(
     auth_user_id = get_auth_user_id_by_email(email)
 
     is_admin = email == ADMIN_EMAIL
-    effective_status = "active" if is_admin else (subscription_status or "inactive")
+    effective_status = "active" if is_admin else (
+        subscription_status or "inactive")
     effective_access = (
         True if is_admin else safe_bool_access(effective_status, access_active)
     )
@@ -234,7 +238,8 @@ def upsert_user_access(
             base_payload["auth_user_id"] = auth_user_id
 
         result = (
-            supabase.table("usuarios").update(base_payload).eq("email", email).execute()
+            supabase.table("usuarios").update(
+                base_payload).eq("email", email).execute()
         )
         data = result.data or []
         return data[0] if data else get_user_by_email(email)
@@ -330,7 +335,8 @@ def create_checkout(body: CheckoutRequest):
             "session_id": session.id,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creando checkout: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error creando checkout: {str(e)}")
 
 
 @app.post("/validate-access")
@@ -414,6 +420,7 @@ def validate_access(body: ValidateAccessRequest):
         "exists": True,
         "access_active": access_active,
         "subscription_status": subscription_status,
+        "cancel_at_period_end": bool(user.get("cancel_at_period_end", False)),
         "plan": user.get("plan") or "free",
         "current_period_end": user.get("current_period_end"),
         "should_show_paywall": should_show_paywall,
@@ -449,7 +456,8 @@ def activate_user(body: ActivateUserRequest):
         "updated_at": now_iso(),
     }
 
-    result = supabase.table("usuarios").update(payload).eq("email", email).execute()
+    result = supabase.table("usuarios").update(
+        payload).eq("email", email).execute()
     data = result.data or []
     return {"ok": True, "data": data[0] if data else get_user_by_email(email)}
 
@@ -501,6 +509,7 @@ def cancel_subscription(body: CancelSubscriptionRequest):
             .update(
                 {
                     "subscription_status": status,
+                    "cancel_at_period_end": True,
                     "current_period_end": current_period_end,
                     "updated_at": now_iso(),
                 }
